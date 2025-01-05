@@ -17,6 +17,7 @@ from langchain import hub
 from langchain_tools import (
     manager,
     SearchGoogleTool,
+    SearchAmazonTool,
     GoToUrlTool,
     GoBackTool,
     ClickElementTool,
@@ -44,6 +45,7 @@ async def main():
     # 2) すべてのToolsをリストに格納
     tools = [
         SearchGoogleTool(),
+        SearchAmazonTool(),
         GoToUrlTool(),
         GoBackTool(),
         ClickElementTool(),

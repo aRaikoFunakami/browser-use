@@ -8,6 +8,8 @@ from browser_use.agent.service import BrowserContext
 from browser_use.browser.browser import Browser
 from browser_use.controller.service import Controller
 from browser_use.dom.service import DomService
+import tiktoken 
+from concurrent.futures import ThreadPoolExecutor
 
 logger = logging.getLogger(__name__)
 # ----------------------------------------------------
@@ -65,6 +67,13 @@ class BrowserUseManager:
         self.DynamicActionModel = self.controller.registry.create_action_model()
         # 履歴を保持するリスト
         self.history = []
+        # トークナイザーの初期化（使用しているモデルに合わせて設定）
+        self.tokenizer = tiktoken.get_encoding("p50k_base")  # 例としてGPT-4を使用
+        # トークン数の上限
+        self.max_tokens = 100000
+         # Executorの初期化
+        self.executor = ThreadPoolExecutor(max_workers=4)  # 必要に応じて調整
+
 
     async def shutdown(self):
         """後始末用: browser_contextやbrowserを閉じる。"""
@@ -87,21 +96,75 @@ class BrowserUseManager:
         #print(f"\n\n history_text: {history_text}")
         return history_text
     
+    def count_tokens_sync(self, text: str) -> int:
+        """同期的にトークン数を計測"""
+        tokens = self.tokenizer.encode(text)
+        return len(tokens)
+
+    async def count_tokens_async(self, text: str) -> int:
+        """非同期的にトークン数を計測"""
+        loop = asyncio.get_event_loop()
+        tokens = await loop.run_in_executor(self.executor, self.tokenizer.encode, text)
+        return len(tokens)
+    
     async def execute_action(self, action_name: str, action_model: ActionModel, action_description: str) -> str:
         """共通アクション実行ロジック"""
         try:
+            # アクションを実行し、結果を取得
             result: ActionResult = await self.controller.act(action_model, self.browser_context)
             if result.error:
                 action_result = f"Error: {result.error}"
             else:
                 action_result = result.extracted_content or "No content extracted."
 
+            # 履歴に追加
             self.add_history(action_description, action_result)
             action_history = await self.get_full_history()
 
-            # DOM情報追加
-            dom_text = await get_page_dom_info(manager.browser_context)
-            action_history_with_current_page_dom =  f"{action_history}\nCurrent page clickable elements:\n{dom_text}"
+            # DOM情報を取得
+            dom_text = await get_page_dom_info(self.browser_context)
+
+            # トークン数を計測
+            history_tokens = self.count_tokens_sync(action_history)
+            dom_tokens = self.count_tokens_sync(dom_text)
+            action_result_tokens = self.count_tokens_sync(action_result)
+
+            # トークン数の合計計算
+            total_tokens = (
+                history_tokens +
+                dom_tokens +
+                action_result_tokens +
+                len(self.tokenizer.encode("\nCurrent page clickable elements:\n"))
+            )
+
+            # トークンが不足する場合の処理
+            if total_tokens > self.max_tokens:
+                # 必要なトークン数を計算
+                excess_tokens = total_tokens - self.max_tokens
+
+                if action_result_tokens > excess_tokens:
+                    # `action_result`を削除またはトリミング
+                    truncated_action_result_tokens = self.tokenizer.encode(action_result)[
+                        :-excess_tokens
+                    ]
+                    action_result = self.tokenizer.decode(truncated_action_result_tokens)
+                else:
+                    # `action_result`を完全に削除
+                    action_result = "[TRUNCATED DUE TO TOKEN LIMIT]"
+                    excess_tokens -= action_result_tokens
+
+                # DOM情報の削除（残りのトークン数が不足する場合）
+                if dom_tokens > excess_tokens:
+                    truncated_dom_tokens = self.tokenizer.encode(dom_text)[:-excess_tokens]
+                    dom_text = self.tokenizer.decode(truncated_dom_tokens)
+                else:
+                    dom_text = "[TRUNCATED DUE TO TOKEN LIMIT]"
+
+            # 最終的な履歴テキスト
+            action_history_with_current_page_dom = (
+                f"{action_history}\nAction result:\n{action_result}\n"
+                f"Current page clickable elements:\n{dom_text}"
+            )
             await asyncio.sleep(0.1)
 
             return action_history_with_current_page_dom
@@ -142,6 +205,24 @@ class SearchGoogleTool(BaseTool):
         action_description = f"search_google(query={query})"
         action_model = manager.DynamicActionModel(search_google=SearchGoogleAction(query=query))  # type: ignore
         return await manager.execute_action("search_google", action_model, action_description)
+    
+
+class SearchAmazonInput(BaseModel):
+    query: str = Field(..., description="Query string to search in Amazon")
+
+class SearchAmazonTool(BaseTool):
+    name: str = "search_amazon"
+    description: str = "Search Amazon with a query string. Input: {'query': '<string>'}"
+    args_schema: Type[BaseModel] = SearchAmazonInput
+
+    def _run(self, query: str) -> str:
+        raise RuntimeError("Use _arun instead.")
+
+    async def _arun(self, query: str) -> str:
+        url = "https://www.amazon.co.jp/s?k=" + query
+        action_description = f"go_to_url({url})"
+        action_model = manager.DynamicActionModel(go_to_url=GoToUrlAction(url=url))   # type: ignore
+        return await manager.execute_action("go_to_url", action_model, action_description)
 
 class GoToUrlInput(BaseModel):
     url: str

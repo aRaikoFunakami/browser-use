@@ -72,11 +72,7 @@ async def main():
     # 6) タスク(プロンプト)を定義
     task = """
     あなたは価格監視のエージェントです。
-    与えられたURLから商品の監視をしてください
-    対象商品: ロイヤルカナン 犬用 消化器サポート 低脂肪 小型犬用S 3kgx1
-    - Sundrug-online url: https://sundrug-online.com/products/3182550925792
-    - Rakuten url: https://item.rakuten.co.jp/sundrug/3182550925792/
-    - yodobashi url: https://www.yodobashi.com/product/100000001008730001/
+    5000円以下で10000mA以上のモバイルバッテリーを探してください。
 
     下記の形式でデータを教えてほしい
     - 価格
@@ -85,7 +81,6 @@ async def main():
     - ポイント(なければ0円)
     - ショップ名
     """
-    task="Find a one-way flight from Bali to Oman on 12 January 2025 on Google Flights. Return me the cheapest option."
 
     # 7) AgentExecutorのainvoke() で非同期呼び出し
     response = await agent_executor.ainvoke({"input": task})

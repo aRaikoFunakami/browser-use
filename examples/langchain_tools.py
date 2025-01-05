@@ -1,49 +1,18 @@
-"""
-LangChain用のBrowserUse Tools一式を管理するサンプル。
-
-[構成]
-1) BrowserUseManager: controllerやbrowser, browser_context, DynamicActionModelをまとめて保持
-2) 各Tool: BrowserUseManagerのインスタンスを利用して実装
-3) メイン(main)でエージェントを作り、各Toolをまとめて使用する
-"""
-
+import asyncio
 import logging
 from typing import Type, Optional
 from pydantic import BaseModel, Field
 from langchain.tools import BaseTool
 
-# ----------------------------------------------------
-# 1) BrowserUseManager (Controller/BrowserContextまとめ)
-# ----------------------------------------------------
 from browser_use.agent.service import BrowserContext
 from browser_use.browser.browser import Browser
 from browser_use.controller.service import Controller
-
-logger = logging.getLogger(__name__)
-
-class BrowserUseManager:
-    def __init__(self):
-        # まとめて初期化
-        self.controller = Controller()
-        self.browser = Browser()
-        self.browser_context = BrowserContext(browser=self.browser)
-        self.DynamicActionModel = self.controller.registry.create_action_model()
-
-    async def shutdown(self):
-        """後始末用: browser_contextやbrowserを閉じる。"""
-        # BrowserContext をclose
-        if self.browser_context and self.browser_context.session is not None:
-            await self.browser_context.close()
-        # Browser自体をclose
-        if self.browser:
-            await self.browser.close()
-
-
-# ----------------------------------------------------
-# 2) ヘルパー: DOM情報を取得して返す
-# ----------------------------------------------------
 from browser_use.dom.service import DomService
 
+logger = logging.getLogger(__name__)
+# ----------------------------------------------------
+# 1) ヘルパー: DOM情報を取得して返す
+# ----------------------------------------------------
 
 async def get_page_dom_info(
     ctx: BrowserContext, highlight_elements: bool = False, max_length: int = 3000
@@ -58,7 +27,7 @@ async def get_page_dom_info(
         highlight_elements=highlight_elements
     )
 
-    # clickable_elements_to_string() でインデックスつきのテキスト生成
+    # clickable_elements_to_string()でインデックスつきのテキスト生成
     dom_text = dom_state.element_tree.clickable_elements_to_string()
 
     # 長すぎる場合は先頭の一部だけ返す
@@ -66,10 +35,10 @@ async def get_page_dom_info(
         dom_text = dom_text[:max_length] + "...(truncated)"
     return dom_text
 
-
 # ----------------------------------------------------
-# 3) 各Tool定義 (共通BrowserUseManagerを参照)
+# 2) 各Tool定義 (共通BrowserUseManagerを参照)
 # ----------------------------------------------------
+from browser_use.controller.registry.views import ActionModel
 from browser_use.agent.views import ActionResult
 from browser_use.controller.views import (
     SearchGoogleAction,
@@ -84,35 +53,82 @@ from browser_use.controller.views import (
     SendKeysAction,
 )
 
+# ----------------------------------------------------
+# 3) BrowserUseManager (Controller/BrowserContextまとめ)
+# ----------------------------------------------------
+class BrowserUseManager:
+    def __init__(self):
+        # まとめて初期化
+        self.controller = Controller()
+        self.browser = Browser()
+        self.browser_context = BrowserContext(browser=self.browser)
+        self.DynamicActionModel = self.controller.registry.create_action_model()
+        # 履歴を保持するリスト
+        self.history = []
+
+    async def shutdown(self):
+        """後始末用: browser_contextやbrowserを閉じる。"""
+        # BrowserContext をclose
+        if self.browser_context and self.browser_context.session is not None:
+            await self.browser_context.close()
+        # Browser自体をclose
+        if self.browser:
+            await self.browser.close()
+
+    def add_history(self, action: str, result: str):
+        """履歴にアクションと結果を追加する"""
+        self.history.append({"action": action, "result": result})
+
+    async def get_full_history(self) -> str:
+        """これまでの履歴をテキスト形式で取得する"""
+        history_text = ""
+        for idx, entry in enumerate(self.history, start=1):
+            history_text += f"{idx}. アクション: {entry['action']}\n   結果: {entry['result']}\n"
+        #print(f"\n\n history_text: {history_text}")
+        return history_text
+    
+    async def execute_action(self, action_name: str, action_model: ActionModel, action_description: str) -> str:
+        """共通アクション実行ロジック"""
+        try:
+            result: ActionResult = await self.controller.act(action_model, self.browser_context)
+            if result.error:
+                action_result = f"Error: {result.error}"
+            else:
+                action_result = result.extracted_content or "No content extracted."
+
+            self.add_history(action_description, action_result)
+            action_history = await self.get_full_history()
+
+            # DOM情報追加
+            dom_text = await get_page_dom_info(manager.browser_context)
+            action_history_with_current_page_dom =  f"{action_history}\nCurrent page clickable elements:\n{dom_text}"
+            await asyncio.sleep(0.1)
+
+            return action_history_with_current_page_dom
+        except Exception as e:
+            error_message = f"Exception in {action_name}: {e}"
+            self.add_history(action_description, error_message)
+            return error_message
 
 # 0引数アクション用クラス
 class GoBackAction(BaseModel):
     pass
 
-
 class ScrollToTextAction(BaseModel):
     text: str = Field(..., description="The text to scroll into view")
 
-
 class GetDropdownOptionsAction(BaseModel):
     index: int = Field(..., description="The highlight index of the <select> element")
-
 
 class SelectDropdownOptionAction(BaseModel):
     index: int = Field(..., description="The highlight index of the <select> element")
     text: str = Field(..., description="The exact option text to select")
 
-
-from browser_use.controller.registry.views import ActionModel
-
-
 # ここで、グローバルに1つの manager を作る (実運用ではシングルトン等にする場合もある)
 manager = BrowserUseManager()
 
-
 class SearchGoogleInput(BaseModel):
     query: str = Field(..., description="Query string to search in Google")
-
 
 class SearchGoogleTool(BaseTool):
     name: str = "search_google"
@@ -123,52 +139,25 @@ class SearchGoogleTool(BaseTool):
         raise RuntimeError("Use _arun instead.")
 
     async def _arun(self, query: str) -> str:
-        try:
-            # ActionModel作成
-            action_model = manager.DynamicActionModel(search_google=SearchGoogleAction(query=query))  # type: ignore
-            # 実行
-            result: ActionResult = await manager.controller.act(
-                action_model, manager.browser_context
-            )
-            if result.error:
-                return f"Error: {result.error}"
-
-            extracted_text = result.extracted_content or "No content extracted."
-            # DOM情報
-            dom_text = await get_page_dom_info(manager.browser_context)
-            return f"{extracted_text}\nCurrent page clickable elements:\n{dom_text}"
-
-        except Exception as e:
-            return f"Exception in search_google: {e}"
-
+        action_description = f"search_google(query={query})"
+        action_model = manager.DynamicActionModel(search_google=SearchGoogleAction(query=query))  # type: ignore
+        return await manager.execute_action("search_google", action_model, action_description)
 
 class GoToUrlInput(BaseModel):
     url: str
 
-
 class GoToUrlTool(BaseTool):
     name: str = "go_to_url"
-    description: str = (
-        "Navigate to a specified URL in the current tab. Input: {'url': '<string>'}"
-    )
+    description: str = "Navigate to a specified URL in the current tab. Input: {'url': '<string>'}"
     args_schema: Type[BaseModel] = GoToUrlInput
 
     def _run(self, url: str) -> str:
         raise RuntimeError("Use _arun instead.")
 
     async def _arun(self, url: str) -> str:
-        try:
-            action_model = manager.DynamicActionModel(go_to_url=GoToUrlAction(url=url))  # type: ignore
-            result = await manager.controller.act(action_model, manager.browser_context)
-            if result.error:
-                return f"Error: {result.error}"
-
-            extracted_text = result.extracted_content or "No content extracted."
-            dom_text = await get_page_dom_info(manager.browser_context)
-            return f"{extracted_text}\nCurrent page clickable elements:\n{dom_text}"
-        except Exception as e:
-            return f"Exception in go_to_url: {e}"
-
+        action_description = f"go_to_url(url={url})"
+        action_model = manager.DynamicActionModel(go_to_url=GoToUrlAction(url=url))  # type: ignore
+        return await manager.execute_action("go_to_url", action_model, action_description)
 
 class GoBackTool(BaseTool):
     name: str = "go_back"
@@ -179,22 +168,12 @@ class GoBackTool(BaseTool):
         raise RuntimeError("Use _arun instead.")
 
     async def _arun(self) -> str:
-        try:
-            action_model = ActionModel(go_back=GoBackAction())  # type: ignore
-            result = await manager.controller.act(action_model, manager.browser_context)
-            if result.error:
-                return f"Error: {result.error}"
-
-            extracted_text = result.extracted_content or "Back done."
-            dom_text = await get_page_dom_info(manager.browser_context)
-            return f"{extracted_text}\nCurrent page clickable elements:\n{dom_text}"
-        except Exception as e:
-            return f"Exception in go_back: {e}"
-
+        action_description = "go_back()"
+        action_model = manager.DynamicActionModel(go_back=GoBackAction())  # type: ignore
+        return await manager.execute_action("go_back", action_model, action_description)
 
 class ClickElementInput(BaseModel):
     index: int = Field(..., description="The highlight index")
-
 
 class ClickElementTool(BaseTool):
     name: str = "click_element"
@@ -205,49 +184,29 @@ class ClickElementTool(BaseTool):
         raise RuntimeError("Use _arun instead.")
 
     async def _arun(self, index: int) -> str:
-        try:
-            action_model = manager.DynamicActionModel(click_element=ClickElementAction(index=index))  # type: ignore
-            result = await manager.controller.act(action_model, manager.browser_context)
-            if result.error:
-                return f"Error: {result.error}"
-
-            extracted_text = result.extracted_content or "Clicked element."
-            dom_text = await get_page_dom_info(manager.browser_context)
-            return f"{extracted_text}\nCurrent page clickable elements:\n{dom_text}"
-        except Exception as e:
-            return f"Exception in click_element: {e}"
-
+        action_description = f"click_element(index={index})"
+        action_model = manager.DynamicActionModel(click_element=ClickElementAction(index=index))  # type: ignore
+        return await manager.execute_action("click_element", action_model, action_description)
 
 class InputTextInput(BaseModel):
     index: int
     text: str
 
-
 class InputTextTool(BaseTool):
     name: str = "input_text"
-    description: str = "Input text into a element with a given highlight index."
+    description:str =  "Input text into a element with a given highlight index."
     args_schema: Type[BaseModel] = InputTextInput
 
     def _run(self, index: int, text: str) -> str:
         raise RuntimeError("Use _arun instead.")
 
     async def _arun(self, index: int, text: str) -> str:
-        try:
-            action_model = manager.DynamicActionModel(input_text=InputTextAction(index=index, text=text))  # type: ignore
-            result = await manager.controller.act(action_model, manager.browser_context)
-            if result.error:
-                return f"Error: {result.error}"
-
-            extracted_text = result.extracted_content or "Text input done."
-            dom_text = await get_page_dom_info(manager.browser_context)
-            return f"{extracted_text}\nCurrent page clickable elements:\n{dom_text}"
-        except Exception as e:
-            return f"Exception in input_text: {e}"
-
+        action_description = f"input_text(index={index}, text={text})"
+        action_model = manager.DynamicActionModel(input_text=InputTextAction(index=index, text=text))  # type: ignore
+        return await manager.execute_action("input_text", action_model, action_description)
 
 class SwitchTabInput(BaseModel):
     page_id: int
-
 
 class SwitchTabTool(BaseTool):
     name: str = "switch_tab"
@@ -258,48 +217,28 @@ class SwitchTabTool(BaseTool):
         raise RuntimeError("Use _arun instead.")
 
     async def _arun(self, page_id: int) -> str:
-        try:
-            action_model = manager.DynamicActionModel(switch_tab=SwitchTabAction(page_id=page_id))  # type: ignore
-            result = await manager.controller.act(action_model, manager.browser_context)
-            if result.error:
-                return f"Error: {result.error}"
-
-            extracted_text = result.extracted_content or f"Switched to tab {page_id}."
-            dom_text = await get_page_dom_info(manager.browser_context)
-            return f"{extracted_text}\nCurrent page clickable elements:\n{dom_text}"
-        except Exception as e:
-            return f"Exception in switch_tab: {e}"
-
+        action_description = f"switch_tab(page_id={page_id})"
+        action_model = manager.DynamicActionModel(switch_tab=SwitchTabAction(page_id=page_id))  # type: ignore
+        return await manager.execute_action("switch_tab", action_model, action_description)
 
 class OpenTabInput(BaseModel):
     url: Optional[str] = None
 
-
 class OpenTabTool(BaseTool):
     name: str = "open_tab"
-    description: str = "Open a new tab and optionally go to a URL."
+    description:str =  "Open a new tab and optionally go to a URL."
     args_schema: Type[BaseModel] = OpenTabInput
 
     def _run(self, url: Optional[str] = None) -> str:
         raise RuntimeError("Use _arun instead.")
 
     async def _arun(self, url: Optional[str] = None) -> str:
-        try:
-            action_model = manager.DynamicActionModel(open_tab=OpenTabAction(url=url or ""))  # type: ignore
-            result = await manager.controller.act(action_model, manager.browser_context)
-            if result.error:
-                return f"Error: {result.error}"
-
-            extracted_text = result.extracted_content or "New tab opened."
-            dom_text = await get_page_dom_info(manager.browser_context)
-            return f"{extracted_text}\nCurrent page clickable elements:\n{dom_text}"
-        except Exception as e:
-            return f"Exception in open_tab: {e}"
-
+        action_description = f"open_tab(url={url})"
+        action_model = manager.DynamicActionModel(open_tab=OpenTabAction(url=url or ""))  # type: ignore
+        return await manager.execute_action("open_tab", action_model, action_description)
 
 class ExtractContentInput(BaseModel):
     value: str = Field("text", description="One of 'text','markdown','html'")
-
 
 class ExtractContentTool(BaseTool):
     name: str = "extract_content"
@@ -310,24 +249,14 @@ class ExtractContentTool(BaseTool):
         raise RuntimeError("Use _arun instead.")
 
     async def _arun(self, value: str) -> str:
-        try:
-            action_model = manager.DynamicActionModel(
-                extract_content=ExtractPageContentAction(value=value)  # type: ignore
-            )
-            result = await manager.controller.act(action_model, manager.browser_context)
-            if result.error:
-                return f"Error: {result.error}"
-
-            extracted_text = result.extracted_content or "No content extracted."
-            dom_text = await get_page_dom_info(manager.browser_context)
-            return f"{extracted_text}\nCurrent page clickable elements:\n{dom_text}"
-        except Exception as e:
-            return f"Exception in extract_content: {e}"
-
+        action_description = f"extract_content(value={value})"
+        action_model = manager.DynamicActionModel(
+            extract_content=ExtractPageContentAction(value=value)  # type: ignore
+        )
+        return await manager.execute_action("extract_content", action_model, action_description)
 
 class DoneInput(BaseModel):
     text: str
-
 
 class DoneTool(BaseTool):
     name: str = "done"
@@ -338,21 +267,12 @@ class DoneTool(BaseTool):
         raise RuntimeError("Use _arun instead.")
 
     async def _arun(self, text: str) -> str:
-        try:
-            action_model = manager.DynamicActionModel(done=DoneAction(text=text))  # type: ignore
-            result = await manager.controller.act(action_model, manager.browser_context)
-            if result.error:
-                return f"Error: {result.error}"
-
-            extracted_text = result.extracted_content or "Task done."
-            return f"{extracted_text}"
-        except Exception as e:
-            return f"Exception in done: {e}"
-
+        action_description = f"done(text={text})"
+        action_model = manager.DynamicActionModel(done=DoneAction(text=text))  # type: ignore
+        return await manager.execute_action("done", action_model, action_description)
 
 class ScrollDownInput(BaseModel):
     amount: Optional[int] = None
-
 
 class ScrollDownTool(BaseTool):
     name: str = "scroll_down"
@@ -363,22 +283,12 @@ class ScrollDownTool(BaseTool):
         raise RuntimeError("Use _arun instead.")
 
     async def _arun(self, amount: Optional[int] = None) -> str:
-        try:
-            action_model = manager.DynamicActionModel(scroll_down=ScrollAction(amount=amount))  # type: ignore
-            result = await manager.controller.act(action_model, manager.browser_context)
-            if result.error:
-                return f"Error: {result.error}"
-
-            extracted_text = result.extracted_content or "Scrolled down."
-            dom_text = await get_page_dom_info(manager.browser_context)
-            return f"{extracted_text}\nCurrent page clickable elements:\n{dom_text}"
-        except Exception as e:
-            return f"Exception in scroll_down: {e}"
-
+        action_description = f"scroll_down(amount={amount})"
+        action_model = manager.DynamicActionModel(scroll_down=ScrollAction(amount=amount))  # type: ignore
+        return await manager.execute_action("scroll_down", action_model, action_description)
 
 class ScrollUpInput(BaseModel):
     amount: Optional[int] = None
-
 
 class ScrollUpTool(BaseTool):
     name: str = "scroll_up"
@@ -389,22 +299,12 @@ class ScrollUpTool(BaseTool):
         raise RuntimeError("Use _arun instead.")
 
     async def _arun(self, amount: Optional[int] = None) -> str:
-        try:
-            action_model = manager.DynamicActionModel(scroll_up=ScrollAction(amount=amount))  # type: ignore
-            result = await manager.controller.act(action_model, manager.browser_context)
-            if result.error:
-                return f"Error: {result.error}"
-
-            extracted_text = result.extracted_content or "Scrolled up."
-            dom_text = await get_page_dom_info(manager.browser_context)
-            return f"{extracted_text}\nCurrent page clickable elements:\n{dom_text}"
-        except Exception as e:
-            return f"Exception in scroll_up: {e}"
-
+        action_description = f"scroll_up(amount={amount})"
+        action_model = manager.DynamicActionModel(scroll_up=ScrollAction(amount=amount))  # type: ignore
+        return await manager.execute_action("scroll_up", action_model, action_description)
 
 class SendKeysInput(BaseModel):
     keys: str
-
 
 class SendKeysTool(BaseTool):
     name: str = "send_keys"
@@ -415,22 +315,12 @@ class SendKeysTool(BaseTool):
         raise RuntimeError("Use _arun instead.")
 
     async def _arun(self, keys: str) -> str:
-        try:
-            action_model = manager.DynamicActionModel(send_keys=SendKeysAction(keys=keys))  # type: ignore
-            result = await manager.controller.act(action_model, manager.browser_context)
-            if result.error:
-                return f"Error: {result.error}"
-
-            extracted_text = result.extracted_content or f"Sent keys: {keys}"
-            dom_text = await get_page_dom_info(manager.browser_context)
-            return f"{extracted_text}\nCurrent page clickable elements:\n{dom_text}"
-        except Exception as e:
-            return f"Exception in send_keys: {e}"
-
+        action_description = f"send_keys(keys={keys})"
+        action_model = manager.DynamicActionModel(send_keys=SendKeysAction(keys=keys))  # type: ignore
+        return await manager.execute_action("send_keys", action_model, action_description)
 
 class ScrollToTextInput(BaseModel):
     text: str
-
 
 class ScrollToTextTool(BaseTool):
     name: str = "scroll_to_text"
@@ -441,22 +331,12 @@ class ScrollToTextTool(BaseTool):
         raise RuntimeError("Use _arun instead.")
 
     async def _arun(self, text: str) -> str:
-        try:
-            action_model = manager.DynamicActionModel(scroll_to_text=ScrollToTextAction(text=text))  # type: ignore
-            result = await manager.controller.act(action_model, manager.browser_context)
-            if result.error:
-                return f"Error: {result.error}"
-
-            extracted_text = result.extracted_content or "Scrolled to text."
-            dom_text = await get_page_dom_info(manager.browser_context)
-            return f"{extracted_text}\nCurrent page clickable elements:\n{dom_text}"
-        except Exception as e:
-            return f"Exception in scroll_to_text: {e}"
-
+        action_description = f"scroll_to_text(text={text})"
+        action_model = manager.DynamicActionModel(scroll_to_text=ScrollToTextAction(text=text))  # type: ignore
+        return await manager.execute_action("scroll_to_text", action_model, action_description)
 
 class GetDropdownOptionsInput(BaseModel):
     index: int
-
 
 class GetDropdownOptionsTool(BaseTool):
     name: str = "get_dropdown_options"
@@ -467,23 +347,13 @@ class GetDropdownOptionsTool(BaseTool):
         raise RuntimeError("Use _arun instead.")
 
     async def _arun(self, index: int) -> str:
-        try:
-            action_model = manager.DynamicActionModel(get_dropdown_options=GetDropdownOptionsAction(index=index))  # type: ignore
-            result = await manager.controller.act(action_model, manager.browser_context)
-            if result.error:
-                return f"Error: {result.error}"
-
-            extracted_text = result.extracted_content or "No dropdown options found."
-            dom_text = await get_page_dom_info(manager.browser_context)
-            return f"{extracted_text}\nCurrent page clickable elements:\n{dom_text}"
-        except Exception as e:
-            return f"Exception in get_dropdown_options: {e}"
-
+        action_description = f"get_dropdown_options(index={index})"
+        action_model = manager.DynamicActionModel(get_dropdown_options=GetDropdownOptionsAction(index=index))  # type: ignore
+        return await manager.execute_action("get_dropdown_options", action_model, action_description)
 
 class SelectDropdownOptionInput(BaseModel):
     index: int
     text: str
-
 
 class SelectDropdownOptionTool(BaseTool):
     name: str = "select_dropdown_option"
@@ -494,16 +364,8 @@ class SelectDropdownOptionTool(BaseTool):
         raise RuntimeError("Use _arun instead.")
 
     async def _arun(self, index: int, text: str) -> str:
-        try:
-            action_model = manager.DynamicActionModel(
-                select_dropdown_option=SelectDropdownOptionAction(index=index, text=text)  # type: ignore
-            )
-            result = await manager.controller.act(action_model, manager.browser_context)
-            if result.error:
-                return f"Error: {result.error}"
-
-            extracted_text = result.extracted_content or "Dropdown option selected."
-            dom_text = await get_page_dom_info(manager.browser_context)
-            return f"{extracted_text}\nCurrent page clickable elements:\n{dom_text}"
-        except Exception as e:
-            return f"Exception in select_dropdown_option: {e}"
+        action_description = f"select_dropdown_option(index={index}, text={text})"
+        action_model = manager.DynamicActionModel(
+            select_dropdown_option=SelectDropdownOptionAction(index=index, text=text)  # type: ignore
+        )
+        return await manager.execute_action("select_dropdown_option", action_model, action_description)
